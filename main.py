@@ -94,17 +94,17 @@ def find_brace_block(text: str, start_pos: int) -> Tuple[int, int]:
 # Description 생성 로직
 
 def make_description_from_content(content: str) -> str:
-    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    stripped = content.strip()
     # define 은 한줄 그대로
-    if content.strip().startswith("#define"):
-        return content.strip()
+    if stripped.startswith("#define"):
+        return stripped
     # enum/struct 내부만 추출 후 각 줄을 DESC_DELIM으로 구분
     if "{" in content and "}" in content:
         inner = content[content.find("{")+1:content.rfind("}")]
         inner_lines = [l.strip().rstrip(',') for l in inner.splitlines() if l.strip()]
         return DESC_DELIM.join(inner_lines)
     # 변수 선언 등은 라인 그대로 넣어도 됨(필요시 공란 유지 가능)
-    return content.strip()
+    return stripped
 
 
 def parse_header_text(source_label: str, text: str) -> List[Dict]:
