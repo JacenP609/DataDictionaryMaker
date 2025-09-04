@@ -5,7 +5,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import pandas as pd
 
 # ───────── 하드코딩 경로 설정 ─────────
@@ -14,7 +14,6 @@ OUT_XLSX      = Path(r"data_dictionary.xlsx")
 
 INCLUDE_VARIABLES = True
 ENCODINGS         = ("utf-8", "utf-8-sig", "cp949", "euc-kr")
-DESC_DELIM        = "!\n"  # Description에 줄 단위 구분자(LLM 투입 용이 & 엑셀 줄바꿈)
 
 # 엑셀 열 너비(문자 단위). set_column과 일치시켜야 줄 수 추정 정확.
 COL_WIDTHS = [20, 28, 24, 90, 44]
@@ -44,10 +43,15 @@ def normalize_newlines(text: str) -> str:
     return "\n".join(ln.rstrip() for ln in text.splitlines())
 
 
-DEFINE_RE = re.compile(r'^\s*#\s*define\s+([A-Za-z_]\w+)\s+(.+?)\s*$', re.M)
-ENUM_START_RE   = re.compile(r'^\s*(?:typedef\s+)?enum(?:\s+class)?\s+([A-Za-z_]\w+)?\s*\{', re.M)
-STRUCT_START_RE = re.compile(r'^\s*(?:typedef\s+)?struct\s+([A-Za-z_]\w+)?\s*\{', re.M)
-VAR_LINE_RE = re.compile(r'^[^\n;]+;\s*$', re.M)
+DEFINE_RE      = re.compile(
+    r'^\s*#\s*define\s+([A-Za-z_]\w*)(?:\s*\([^\n]*\))?(?:[ \t]+(.*?))?\s*$',
+    re.M,
+)
+BLOCK_START_RE = re.compile(
+    r'^\s*(?:typedef\s+)?(struct|enum(?:\s+class)?|union)\s+([A-Za-z_]\w+)?\s*\{',
+    re.M,
+)
+VAR_LINE_RE    = re.compile(r'^[^\n;]+;\s*$', re.M)
 
 
 def looks_like_var_decl(line: str) -> bool:
@@ -61,19 +65,25 @@ def looks_like_var_decl(line: str) -> bool:
 
 def split_type_name(decl: str) -> Tuple[str, str]:
     s = decl.strip().rstrip(';').strip()
-    if "," in s: return "", ""
+    if '=' in s:
+        s = s.split('=')[0].strip()
+    if "," in s:
+        return "", ""
     toks = s.split()
-    if not toks: return "", ""
-    name = toks[-1]
-    m = re.match(r'([A-Za-z_]\w*)(.*)', name)
-    if m: name = m.group(1)
+    if not toks:
+        return "", ""
+    name = toks[-1].lstrip('*')
+    m = re.match(r'([A-Za-z_]\w*)', name)
+    if m:
+        name = m.group(1)
     cut = s.rfind(name)
-    if cut == -1: return "", ""
+    if cut == -1:
+        return "", ""
     typ = s[:cut].strip()
     return typ, name
 
 
-def find_brace_block(text: str, start_pos: int) -> Tuple[int, int]:
+def find_brace_block(text: str, start_pos: int) -> Optional[Tuple[int, int]]:
     depth = 0
     i = start_pos
     while i < len(text):
@@ -84,76 +94,75 @@ def find_brace_block(text: str, start_pos: int) -> Tuple[int, int]:
             depth -= 1
             if depth == 0:
                 j = i + 1
-                while j < len(text) and text[j].isspace(): j += 1
-                if j < len(text) and text[j] == ';': j += 1
+                while j < len(text) and text[j].isspace():
+                    j += 1
+                if j < len(text) and text[j] == ';':
+                    j += 1
                 return start_pos, j
         i += 1
-    return start_pos, start_pos
-
-
-# Description 생성 로직
-
-def make_description_from_content(content: str) -> str:
-    stripped = content.strip()
-    # define 은 한줄 그대로
-    if stripped.startswith("#define"):
-        return stripped
-    # enum/struct 내부만 추출 후 각 줄을 DESC_DELIM으로 구분
-    if "{" in content and "}" in content:
-        inner = content[content.find("{")+1:content.rfind("}")]
-        inner_lines = [l.strip().rstrip(',') for l in inner.splitlines() if l.strip()]
-        return DESC_DELIM.join(inner_lines)
-    # 변수 선언 등은 라인 그대로 넣어도 됨(필요시 공란 유지 가능)
-    return stripped
+    return None
 
 
 def parse_header_text(source_label: str, text: str) -> List[Dict]:
     rows: List[Dict] = []
-    # 1) #define (함수형 매크로 제외)
+    block_ranges: List[Tuple[int, int]] = []
+    # 1) #define
     for m in DEFINE_RE.finditer(text):
         name = m.group(1)
-        if "(" in name and ")" in name:
-            continue
         body = m.group(0).strip()
         rows.append({
             "Source": source_label,
             "Parameter Name": name,
             "Data Type": "Macro",
             "Content": body,
-            "Description": make_description_from_content(body)
+            "Description": "",
         })
-    # 2) enum/struct 블록
-    for kind_re in (ENUM_START_RE, STRUCT_START_RE):
-        start = 0
-        while True:
-            m = kind_re.search(text, pos=start)
-            if not m: break
-            brace_open = text.find("{", m.start())
-            if brace_open == -1: break
-            b0, b1 = find_brace_block(text, brace_open)
-            header_start = m.start()
-            content = text[header_start:b1].strip()
-            rows.append({
-                "Source": source_label,
-                "Parameter Name": "-",
-                "Data Type": "-",
-                "Content": content,
-                "Description": make_description_from_content(content)
-            })
-            start = b1
-    # 3) 변수 선언(옵션)
+    # 2) enum/struct/union 블록 (중첩 방지)
+    start = 0
+    while True:
+        m = BLOCK_START_RE.search(text, pos=start)
+        if not m:
+            break
+        if any(b0 <= m.start() < b1 for b0, b1 in block_ranges):
+            start = m.start() + 1
+            continue
+        brace_open = text.find("{", m.start())
+        if brace_open == -1:
+            start = m.end()
+            continue
+        res = find_brace_block(text, brace_open)
+        if not res:
+            start = brace_open + 1
+            continue
+        b0, b1 = res
+        block_ranges.append((m.start(), b1))
+        content = text[m.start():b1].strip()
+        rows.append({
+            "Source": source_label,
+            "Parameter Name": "-",
+            "Data Type": "-",
+            "Content": content,
+            "Description": "",
+        })
+        start = b1
+    # 3) 변수 선언(옵션) - 블록 밖에서만 추출
     if INCLUDE_VARIABLES:
         for vm in VAR_LINE_RE.finditer(text):
+            pos = vm.start()
+            if any(b0 <= pos < b1 for b0, b1 in block_ranges):
+                continue
             line = vm.group(0)
-            if not looks_like_var_decl(line): continue
+            if not looks_like_var_decl(line):
+                continue
             typ, name = split_type_name(line)
-            if not typ or not name: continue
+            if not typ or not name:
+                continue
             rows.append({
                 "Source": source_label,
                 "Parameter Name": name,
                 "Data Type": typ,
                 "Content": line.strip(),
-                "Description": ""  # 변수는 설명 비워둠
+                "Description": "",
             })
     return rows
 
